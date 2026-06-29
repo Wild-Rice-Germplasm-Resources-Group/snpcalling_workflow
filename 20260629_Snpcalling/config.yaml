@@ -1,0 +1,28 @@
+workdir: /share/org/CAASZHENGXM/caas_zhengxm02/user_analysis/liupeifeng/snp_calling/
+
+samples: /share/org/CAASZHENGXM/caas_zhengxm02/user_analysis/liupeifeng/snp_calling/samples.tsv
+
+ref_fa: /share/appspace_data/shared_groups/caas_zhengxm04_share_software/public_data/01.Reference/01.Oryza_sativa/Nipponbare_IRGSP1.0/Nipponbare_IRGSP1.0.fasta
+
+ref_dir: 00_ref
+
+tmpdir: tmp
+
+call_snp_threads: 32 #参考基因组分区，不要改
+
+miss_threshold: 0.3
+
+#选择染色体
+chromosomes:
+  - Chr1
+  - Chr2
+  - Chr3
+  - Chr4
+  - Chr5
+  - Chr6
+  - Chr7
+  - Chr8
+  - Chr9
+  - Chr10
+  - Chr11
+  - Chr12

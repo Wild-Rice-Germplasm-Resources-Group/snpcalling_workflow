@@ -1,0 +1,541 @@
+import pandas as pd
+import re
+import os
+import warnings
+import requests
+warnings.filterwarnings('ignore')
+
+ruleorder: callSNP_gatk4 > GenotypeGVCFs > CombineGVCFs > index_vcf
+localrules: all, fa_interval2bed
+
+### dependencies:
+# pip3 install openpyxl pyasynchat pyyaml
+# cpanm MCE::Loop
+###
+
+# ============================================================
+# Read user config from YAML
+# ============================================================
+
+doc_path = config["samples"]
+workdir_now = config["workdir"]
+
+# 原始参考基因组：只读，可以来自公共目录
+raw_ref_fa = config["ref_fa"]
+
+# 工作目录中的本地参考基因组目录
+REF_DIR = config.get("ref_dir", "00_ref")
+spe_fa = f"{REF_DIR}/ref.fa"
+spe_dict = os.path.splitext(spe_fa)[0] + ".dict"
+
+# 临时目录：默认放在工作目录 tmp/，不再默认使用 /dev/shm
+TMPDIR = config.get("tmpdir", "tmp")
+if not os.path.isabs(TMPDIR):
+    TMPDIR = os.path.join(workdir_now, TMPDIR)
+
+# 需要保留的染色体；为空则保留参考基因组全部序列
+SELECT_CHROMS = config.get("chromosomes", [])
+
+# GATK scatter interval number
+#参考基因组分区
+call_snp_threads = int(config.get("call_snp_threads", 32)) ##### 不要改！！
+#call_snp_threads = 1 ##### 不要改！！
+
+
+def get_genome_size_from_fai(fai_file):
+    genome_size = 0
+    with open(fai_file, "r") as f:
+        for line in f:
+            if line.strip():
+                genome_size += int(line.split("\t")[1])
+    return genome_size
+
+
+def read_list_file(file):
+    with open(file, 'r') as f:
+        lines = f.readlines()
+        lines = [line.strip() for line in lines]
+    return lines
+
+def read_tsv_file(file):
+    with open(file, 'r') as f:
+        lines = f.readlines()
+        data = [line.strip().split('\t') for line in lines if line.strip()]
+    return data
+
+sids_reads = read_tsv_file(doc_path)
+sids = [item[0] for item in sids_reads]
+
+#sids = sids[:3]
+
+##### software paths (start)
+# ============================================================
+# Software paths
+# 软件从当前 micromamba 环境调用
+# ============================================================
+
+SAMTOOLS = 'samtools'
+BCFTOOLS = 'bcftools'
+BGZIP = 'bgzip'
+TABIX = 'tabix'
+FASTP = 'fastp'
+BWA = 'bwa'
+SAMBLASTER = 'samblaster'
+gatk4_bin = 'gatk'
+
+
+# ============================================================
+# Fixed public Perl scripts and Perl modules
+# 这几个路径写死，不需要在 YAML 中配置
+# ============================================================
+
+PIPELINE_BIN = "/share/appspace_data/shared_groups/caas_zhengxm04_share_software/bin"
+
+GC_SCRIPT = f"{PIPELINE_BIN}/pl/1.1.cal_GC.pl"
+FLT_VCF_SCRIPT = f"{PIPELINE_BIN}/pl/2.0.MUTATION.pre_flt.pl"
+PERL_PM_DIR = f"{PIPELINE_BIN}/pm"
+
+for required_path in [GC_SCRIPT, FLT_VCF_SCRIPT, PERL_PM_DIR]:
+    if not os.path.exists(required_path):
+        raise FileNotFoundError(f"Required pipeline file or directory not found: {required_path}")
+##### software paths (end)
+
+##### start to run
+shell.executable('bash')
+workdir: workdir_now
+
+i_intervals=["%04d"%(ii) for ii in range(0, call_snp_threads)]
+
+
+def sra2ref_fa_wildcards(wildcards):
+    return spe_fa
+
+
+if not os.path.exists(TMPDIR):
+    os.makedirs(TMPDIR)
+
+rule prepare_ref_fa:
+    input:
+        raw_ref = raw_ref_fa
+    output:
+        fa = spe_fa
+    run:
+        os.makedirs(os.path.dirname(output.fa), exist_ok=True)
+
+        if os.path.lexists(output.fa):
+            os.remove(output.fa)
+
+        # 如果 config.yaml 没有指定 chromosomes，就软链接整个参考基因组
+        if len(SELECT_CHROMS) == 0:
+            os.symlink(os.path.abspath(str(input.raw_ref)), output.fa)
+
+        # 如果 config.yaml 指定了 chromosomes，就只提取这些染色体
+        else:
+            chroms = set(SELECT_CHROMS)
+            seen = set()
+            write_seq = False
+
+            with open(input.raw_ref, "r") as fin, open(output.fa, "w") as fout:
+                for line in fin:
+                    if line.startswith(">"):
+                        seq_id = line[1:].strip().split()[0]
+                        write_seq = seq_id in chroms
+                        if write_seq:
+                            seen.add(seq_id)
+                            fout.write(line)
+                    else:
+                        if write_seq:
+                            fout.write(line)
+
+            missing = chroms - seen
+            if missing:
+                raise ValueError(
+                    "These chromosomes were not found in reference FASTA: "
+                    + ",".join(sorted(missing))
+                )
+
+
+rule all:
+    input:
+        spe_fa,
+        spe_fa + '.fai',
+        spe_dict,
+        spe_fa + '.bwt',
+        expand(spe_fa + '.intervals/{i_interval}-scattered.interval_list.bed', i_interval=i_intervals),
+
+        expand('02_fq/{sid}_1.fastq.gz', sid=sids),
+        expand('02_fq/{sid}_2.fastq.gz', sid=sids),
+        expand('04_bam/{sid}.sorted.bam.GCstat', sid=sids),
+        expand('05_callSNP/1.gvcf/{sid}/{sid}_{i_interval}.g.vcf.gz.tbi', sid=sids, i_interval=i_intervals),
+        '04_bam.GCstat',
+        expand('05_callSNP/2.combine/{i_interval}.g.vcf.gz', i_interval=i_intervals),
+        expand('05_callSNP/3.genotype/{i_interval}.vcf.gz', i_interval=i_intervals),
+        expand('05_callSNP/4.split_snp_indel/{i_interval}.{type}.vcf.gz', i_interval=i_intervals, type=['snps', 'indels']),
+        expand('05_callSNP/5.flt.snps/{i_interval}.vcf.gz', i_interval=i_intervals),
+        expand('05_callSNP/5.flt.indels/{i_interval}.vcf.gz', i_interval=i_intervals),
+        '06_snp/3.genotype.vcf.gz',
+        '06_snp/5.flt.snps.vcf.gz',
+        '06_snp/5.flt.indels.vcf.gz',
+    default_target: True
+
+
+rule create_symlinks:
+    output:
+        expand('02_fq/{sid}_1.fastq.gz', sid=sids),
+        expand('02_fq/{sid}_2.fastq.gz', sid=sids)
+    run:
+        os.makedirs('02_fq', exist_ok=True)
+
+        for sid, read1, read2 in sids_reads:
+            out1 = f'02_fq/{sid}_1.fastq.gz'
+            out2 = f'02_fq/{sid}_2.fastq.gz'
+
+            if os.path.lexists(out1):
+                os.remove(out1)
+            if os.path.lexists(out2):
+                os.remove(out2)
+
+            os.symlink(read1, out1)
+            os.symlink(read2, out2)
+
+
+rule filter_fq:
+    # by fastp
+    input:
+        fq1 = '02_fq/{sid}_1.fastq.gz',
+        fq2 = '02_fq/{sid}_2.fastq.gz',
+    output:
+        fq1 = '03_fq_filter/{sid}_1.fq.gz',
+        fq2 = '03_fq_filter/{sid}_2.fq.gz',
+        json = '03_fq_filter/{sid}.json',
+        html = '03_fq_filter/{sid}.html',
+    params:
+        outdir = '03_fq_filter'
+    threads: 16
+    #priority: 30
+    shell:
+        """
+        {FASTP} -i {input.fq1} -I {input.fq2} -o {output.fq1} -O {output.fq2} --json {output.json} --html {output.html}  --thread {threads}
+        """
+
+rule split_fa_to_interval:
+    input:
+        fa = '{path}/{file}.fa',
+        fa_dict = '{path}/{file}.dict',
+        fai_dict = '{path}/{file}.fa.fai',
+    output:
+        expand('{{path}}/{{file}}.fa.intervals/{i_interval}-scattered.interval_list',
+               i_interval=i_intervals),
+    params:
+        split_count = call_snp_threads,
+        outdir = '{path}/{file}.fa.intervals',
+    shell:
+        """
+        {gatk4_bin} --java-options "-Djava.io.tmpdir={TMPDIR}" \
+            SplitIntervals \
+            -R {input.fa} \
+            -O {params.outdir} \
+            --scatter-count {params.split_count}
+        """
+
+
+rule fa_interval2bed:
+    input:
+        '{path}/{file}.fa.intervals/{i_interval}-scattered.interval_list'
+    output:
+        '{path}/{file}.fa.intervals/{i_interval}-scattered.interval_list.bed'
+    run:
+        with open(input[0], 'r') as f:
+            lines = f.readlines()
+            with open(output[0], 'w') as f2:
+                for line in lines:
+                    if line.startswith('@'):
+                        continue
+                    line_spilt = line.split('\t')
+                    f2.write(line_spilt[0] + '\t' + str(int(line_spilt[1]) - 1) + '\t' + line_spilt[2] + '\n')
+
+rule fa_gen_dict:
+    input:
+        '{path}/{file}.fa'
+    output:
+        '{path}/{file}.dict'
+    shell:
+        """
+        {SAMTOOLS} dict -o {output} {input}
+        """
+
+rule index_fa:
+    input:
+        fa = '{path}/{file}.fa',
+    output:
+        fa_index = '{path}/{file}.fa.fai',
+    shell:
+        """
+        {SAMTOOLS} faidx {input.fa}
+        """
+
+rule bwa_index:
+    input:
+        fa = '{path}/{file}.fa'
+    output:
+        '{path}/{file}.fa.amb',
+        '{path}/{file}.fa.ann',
+        '{path}/{file}.fa.pac',
+        '{path}/{file}.fa.sa',
+        '{path}/{file}.fa.bwt',
+    log:
+        '{path}/{file}.fa.index.log',
+    shell:
+        """
+        {BWA} index {input.fa} >> {log} 2>&1
+        """
+
+rule bwa_mem:
+    input:
+        fa = sra2ref_fa_wildcards,
+        index = lambda wildcards: sra2ref_fa_wildcards(wildcards) + '.bwt',
+        fq1 = '03_fq_filter/{sid}_1.fq.gz',
+        fq2 = '03_fq_filter/{sid}_2.fq.gz',
+    output:
+        bam = '04_bam/{sid}.sorted.bam',
+    params:
+        outdir = '04_bam',
+        bwa_rg = '@RG\\tID:{sid}\\tSM:{sid}\\tPL:illumina',
+        tmpdir = expand('{TMPDIR}/bwa_mem.{{sid}}.tmp', TMPDIR=TMPDIR),
+    threads: 32
+    priority: 40
+    log: '04_bam/{sid}.sorted.bam.log'
+    shell:
+        """
+        {BWA} mem -M -R '{params.bwa_rg}' -t {threads} {input.fa} {input.fq1} {input.fq2} 2>>{log} | {SAMBLASTER} -M 2>>{log} | {SAMTOOLS} sort --threads 16 -o {output.bam} -m 1G -T {params.tmpdir} 2>> {log}
+        """
+
+rule bwa_mem_bam_index:
+    input:
+        bam = '04_bam/{sid}.sorted.bam',
+    output:
+        bai = '04_bam/{sid}.sorted.bam.bai',
+    shell:
+        """
+        {SAMTOOLS} index {input.bam}
+        """
+
+
+rule gen_gc_stat:
+    input:
+        bam = '04_bam/{sid}.sorted.bam',
+        bai = '04_bam/{sid}.sorted.bam.bai',
+        fai = spe_fa + '.fai',
+    output:
+        GCstat = '04_bam/{sid}.sorted.bam.GCstat',
+    threads: 1
+    log:
+        '04_bam/{sid}.sorted.bam.GCstat.log'
+    shell:
+        r"""
+        set -euo pipefail
+
+        export PERL5LIB={PERL_PM_DIR}:${{PERL5LIB:-}}
+
+        GENOME_SIZE=$(awk '{{sum += $2}} END {{print sum}}' {input.fai})
+
+        perl {GC_SCRIPT} \
+            {input.bam} \
+            {output.GCstat} \
+            $GENOME_SIZE \
+            > {log} 2>&1
+        """
+
+rule merge_GCstat_file:
+    # 合并GCstat文件；第一行是header
+    input:
+        GCstats = expand('04_bam/{sid}.sorted.bam.GCstat', sid=sids),
+        fai = spe_fa + '.fai',
+    output:
+        GCstat = '04_bam.GCstat',
+    run:
+        genome_size = get_genome_size_from_fai(input.fai)
+
+        with open(output.GCstat, 'w') as f:
+            for i in range(len(input.GCstats)):
+                with open(input.GCstats[i], 'r') as f2:
+                    lines = f2.readlines()
+                    if i == 0:
+                        f.write(lines[0])
+
+                    line1_split = lines[1].split('\t')
+                    line1_split[7] = float(line1_split[5]) / genome_size
+                    line1_split[6] = float(line1_split[4]) / genome_size
+                    f.write('\t'.join(map(str, line1_split)) + '\n')
+
+rule index_vcf:
+    input:
+        vcf = '{path}/{file}.vcf.gz',
+    output:
+        vcf_index = '{path}/{file}.vcf.gz.tbi',
+    shell:
+        """
+        {BCFTOOLS} index {input.vcf}
+        """
+
+
+rule callSNP_gatk4:
+    input:
+        bam = '04_bam/{sid}.sorted.bam',
+        bai = '04_bam/{sid}.sorted.bam.bai',
+        ref = spe_fa,
+        bed = spe_fa + '.intervals/{i_interval}-scattered.interval_list.bed',
+    output:
+        vcf = '05_callSNP/1.gvcf/{sid}/{sid}_{i_interval}.g.vcf.gz',
+        vcf_index = '05_callSNP/1.gvcf/{sid}/{sid}_{i_interval}.g.vcf.gz.tbi',
+    threads: 4
+    log: '05_callSNP/1.gvcf/{sid}/{sid}_{i_interval}.g.vcf.log'
+    shell:
+        """
+        {gatk4_bin} --java-options "-Djava.io.tmpdir={TMPDIR}" \
+            HaplotypeCaller \
+            -L {input.bed} \
+            --smith-waterman FASTEST_AVAILABLE \
+            --native-pair-hmm-threads {threads} \
+            --pair-hmm-implementation FASTEST_AVAILABLE \
+            -R {input.ref} \
+            -I {input.bam} \
+            -O {output.vcf} \
+            -ERC GVCF > {log} 2>&1
+        """
+
+rule CombineGVCFs:
+    input:
+        gvcfs = expand('05_callSNP/1.gvcf/{sid}/{sid}_{{i_interval}}.g.vcf.gz', sid=sids),
+        gvcfs_index = expand('05_callSNP/1.gvcf/{sid}/{sid}_{{i_interval}}.g.vcf.gz.tbi', sid=sids),
+        ref = spe_fa,
+        bed = spe_fa + '.intervals/{i_interval}-scattered.interval_list.bed',
+    output:
+        gvcf = '05_callSNP/2.combine/{i_interval}.g.vcf.gz',
+        gvcf_tbi = '05_callSNP/2.combine/{i_interval}.g.vcf.gz.tbi',
+    threads: 16
+    log: '05_callSNP/2.combine/{i_interval}.g.vcf.gz.log',
+    params:
+        extra = '',
+        gvcfs_v = expand(' -V 05_callSNP/1.gvcf/{sid}/{sid}_{{i_interval}}.g.vcf.gz ', sid=sids),
+    shell:
+        """
+        {gatk4_bin} --java-options "-Djava.io.tmpdir={TMPDIR}" \
+            CombineGVCFs \
+            {params.extra} \
+            -L {input.bed} \
+            -R {input.ref} \
+            {params.gvcfs_v} \
+            -O {output.gvcf} > {log} 2>&1
+        """
+
+rule GenotypeGVCFs:
+    input:
+        gvcf = '05_callSNP/2.combine/{i_interval}.g.vcf.gz',
+        gvcf_tbi = '05_callSNP/2.combine/{i_interval}.g.vcf.gz.tbi',
+        ref = spe_fa,
+        bed = spe_fa + '.intervals/{i_interval}-scattered.interval_list.bed',
+    output:
+        vcf = '05_callSNP/3.genotype/{i_interval}.vcf.gz',
+        vcf_tbi = '05_callSNP/3.genotype/{i_interval}.vcf.gz.tbi',
+    threads: 2
+    log: '05_callSNP/3.genotype/{i_interval}.vcf.gz.log'
+    params:
+        extra = '',
+        java_opts="",  # optional
+    shell:
+        """
+        {gatk4_bin} --java-options "-Djava.io.tmpdir={TMPDIR}" \
+            GenotypeGVCFs \
+            {params.extra} \
+            -L {input.bed} \
+            -R {input.ref} \
+            -V {input.gvcf} \
+            -O {output.vcf} > {log} 2>&1
+        """
+
+rule split_snp_indel:
+    input:
+        vcf = '05_callSNP/3.genotype/{i_interval}.vcf.gz',
+        ref = spe_fa,
+    output:
+        vcf_snp = '05_callSNP/4.split_snp_indel/{i_interval}.{type}.vcf.gz',
+    log: '05_callSNP/4.split_snp_indel/{i_interval}.{type}.vcf.gz.log',
+    threads: 8
+    wildcard_constraints:
+        type = '|'.join(['snps', 'indels'])
+    shell:
+        # using bcftools
+        """
+        {BCFTOOLS} view -O z -o {output.vcf_snp} --threads {threads} --types {wildcards.type} {input.vcf} > {log} 2>&1
+        """
+
+rule filter_vcf_snps_indels:
+    input:
+        vcf = '05_callSNP/4.split_snp_indel/{i_interval}.{type}.vcf.gz',
+        GCstat = '04_bam.GCstat',
+    output:
+        vcf_snp_flt = '05_callSNP/5.flt.{type}/{i_interval}.vcf.gz',
+    log: '05_callSNP/5.flt.{type}/{i_interval}.vcf.gz.log',
+    threads: 32
+    params:
+        miss_threshold = config.get("miss_threshold", 0.3),
+    shell:
+        """
+        export PERL5LIB={PERL_PM_DIR}:$PERL5LIB
+        perl {FLT_VCF_SCRIPT} --vcf {input.vcf} --miss_threshold {params.miss_threshold} -t {wildcards.type} -p {threads} -G {input.GCstat} -o {output.vcf_snp_flt} > {log} 2>&1
+        """
+
+
+rule merge_vcf_gen_list:
+    input: 
+        vcfs = expand('05_callSNP/{{dir}}/{i_interval}.vcf.gz', i_interval=i_intervals),
+        #vcf_tbis = expand('05_callSNP/3.genotype/{i_interval}.vcf.gz.tbi', i_interval=i_intervals),
+    output:
+        vcfs_list = '06_snp/{dir}.vcfs_list'
+    run:
+        with open(output.vcfs_list, 'w') as f:
+            for i in range(len(input.vcfs)):
+                f.write(input.vcfs[i] + '\n')
+
+rule merge_vcf:
+    input:
+        vcfs = expand('05_callSNP/{{dir}}/{i_interval}.vcf.gz', i_interval=i_intervals),
+        #vcf_tbis = expand('05_callSNP/{{dir}}/{i_interval}.vcf.gz.tbi', i_interval=i_intervals),
+        vcfs_list = '06_snp/{dir}.vcfs_list'
+    output:
+        vcf = protected('06_snp/{dir}.vcf.gz'),
+    threads: 8
+    shell:
+        """
+        {BCFTOOLS} concat --threads {threads} --file-list {input.vcfs_list} --naive --output {output.vcf}
+        """
+
+# rule vcf_rm_ids_gen_list:
+#     output:
+#         outfile = temp('06_snp/3.rm_id.vcf.gz.list'),
+#     run:
+#         # config['rm_ids']
+#         with open(output.outfile, 'w') as f:
+#             for i in range(len(config['rm_ids'])):
+#                 f.write(config['rm_ids'][i] + '\n')
+
+# rule vcf_rm_ids:
+#     input:
+#         vcf = '06_snp/2.raw_merged.vcf.gz',
+#         rm_ids_list = '06_snp/3.rm_id.vcf.gz.list',
+#     output:
+#         vcf = '06_snp/3.rm_id.vcf.gz',
+#     threads: 12
+#     run:
+#         if len(config['rm_ids']) == 0:
+#             shell('cp {input.vcf} {output.vcf}')
+#         else:
+#             shell("""{BCFTOOLS} view --threads 2 --samples-file '^{input.rm_ids_list}' {input.vcf} | {BGZIP} -c -@ {threads} > {output.vcf}""")
+
+
+
+
+
+
+

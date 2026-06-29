@@ -1,0 +1,15 @@
+executor: cluster-generic
+jobs: 2
+local-cores: 1
+latency-wait: 60
+rerun-incomplete: true
+printshellcmds: true
+keep-going: false
+
+cluster-generic-submit-cmd: "/share/appspace_data/shared_groups/caas_zhengxm04_share_software/public_pipeline/snp_calling_lsf/profiles/lsf_generic/lsf-submit.py"
+cluster-generic-status-cmd: "/share/appspace_data/shared_groups/caas_zhengxm04_share_software/public_pipeline/snp_calling_lsf/profiles/lsf_generic/lsf-status.py"
+cluster-generic-cancel-cmd: "bkill"
+
+default-resources:
+  - lsf_queue=c01
+  - walltime=720
